@@ -47,19 +47,43 @@ def niryo_pose_to_matrix_from_obj(pose):
     T[:3,  3] = [pose.x, pose.y, pose.z]
     return T
 
-# ----------------------------------------------------
-# Helper (TEMP): FK base -> "hand" approximated by TCP
-# ----------------------------------------------------
-def fk_base_to_hand_temp(joints, T_base_tcp):
+# ----------------------------------------------------------
+# Helper: "virtual hand" FK using robot FK with q6 frozen
+# ----------------------------------------------------------
+def fk_base_to_hand_virtual(robot, joints, q6_ref=0.0):
     """
-    TEMPORARY placeholder FK.
+    Compute a 'virtual hand' frame ^baseT_hand using the robot's own FK.
 
-    For now we approximate the 'hand' (wrist / joint5 frame) with the TCP frame.
-    This lets us wire the hand–eye pipeline end-to-end without changing math
-    elsewhere. Later, this will be replaced by a true FK up to joint 5.
+    Idea:
+      - The camera is rigid to the wrist (joint 5) and does NOT move with q6.
+      - We therefore build a frame that depends only on joints 1..5 by
+        *artificially freezing* q6 to a fixed reference angle q6_ref
+        before calling the robot's forward kinematics.
+
+    Parameters
+    ----------
+    robot : pyn.NiryoRobot
+        Connected robot instance, used to call forward_kinematics.
+    joints : array-like of length 6
+        Actual joint angles [q1..q6] in radians.
+    q6_ref : float, optional
+        Reference angle (rad) used for joint 6 when computing the FK.
+
+    Returns
+    -------
+    T_hand : (4,4) ndarray
+        Homogeneous transform ^baseT_hand for this configuration.
     """
-    # 'joints' is shape (6,), but we don't use it yet.
-    return T_base_tcp.copy()
+    q = np.array(joints, dtype=float).reshape(6,)
+    q[5] = float(q6_ref)          # overwrite actual q6 → freeze it
+
+    # PyNiryo: forward_kinematics(joints: list[float]) → Pose object
+    pose_fk = robot.forward_kinematics(q.tolist())
+
+    # Re-use your existing helper to make a 4x4 from pose
+    T_hand = niryo_pose_to_matrix_from_obj(pose_fk)
+    return T_hand
+
 
 # ===============================
 # Step 2: Global config + run dir
@@ -570,142 +594,148 @@ else:
 
     print(f"[POSE] Saved ^cameraT_board for {len(valid_image_names)} views to {T_CAM_BOARD_PATH}")
 
-    # ==============================================================
-    # Step 9: Hand–eye calibration (Tsai) with TEMP hand≈tcp via FK
-    # ==============================================================
+    # ==========================================================
+    # Step 9: Hand–eye calibration (Tsai) using a virtual hand
+    #          (camera depends only on joints 1..5, q6 frozen)
+    # ==========================================================
+    print("\n[HANDEYE] Starting hand–eye calibration (Tsai, virtual hand frame)...")
 
-    print("\n[HANDEYE] Starting hand–eye calibration (Tsai, TEMP hand≈tcp)...")
+    # --- Load robot-side data: ^baseT_tcp and joints, both with image_names ---
+    tcp_npz = np.load(T_BASE_TCP_PATH, allow_pickle=True)
+    print("[HANDEYE] T_base_tcp_all_final.npz keys:", list(tcp_npz.keys()))
+    if "T_base_tcp" not in tcp_npz or "image_names" not in tcp_npz:
+        raise RuntimeError(
+            "[HANDEYE][ERROR] T_base_tcp_all_final.npz must contain "
+            "'T_base_tcp' and 'image_names'."
+        )
 
-    # --- Load robot-side data: base->tcp + image_names ---
-    if not T_BASE_TCP_PATH.exists():
-        print(f"[HANDEYE][ERROR] Robot TCP file not found: {T_BASE_TCP_PATH}")
-    else:
-        tcp_npz = np.load(T_BASE_TCP_PATH, allow_pickle=True)
-        print(f"[HANDEYE] {T_BASE_TCP_PATH.name} keys:", list(tcp_npz.keys()))
+    T_base_tcp_all = tcp_npz["T_base_tcp"]      # (N,4,4) but only used for sanity
+    image_names_tcp = tcp_npz["image_names"]    # (N,)
 
-        if "T_base_tcp" not in tcp_npz or "image_names" not in tcp_npz:
-            print("[HANDEYE][ERROR] Missing 'T_base_tcp' or 'image_names' in TCP file; aborting hand–eye.")
-        elif not JOINTS_PATH.exists():
-            print(f"[HANDEYE][ERROR] Joints file not found: {JOINTS_PATH}; aborting hand–eye.")
-        elif not T_CAM_BOARD_PATH.exists():
-            print(f"[HANDEYE][ERROR] Camera-board file not found: {T_CAM_BOARD_PATH}; aborting hand–eye.")
-        else:
-            # --- Load joints (robot FK input) ---
-            joints_npz = np.load(JOINTS_PATH, allow_pickle=True)
-            print(f"[HANDEYE] {JOINTS_PATH.name} keys:", list(joints_npz.keys()))
+    joints_npz = np.load(JOINTS_PATH, allow_pickle=True)
+    print("[HANDEYE] joints_all_final.npz keys:", list(joints_npz.keys()))
+    if "joints_all" not in joints_npz or "image_names" not in joints_npz:
+        raise RuntimeError(
+            "[HANDEYE][ERROR] joints_all_final.npz must contain "
+            "'joints_all' and 'image_names'."
+        )
 
-            if "joints_all" not in joints_npz or "image_names" not in joints_npz:
-                print("[HANDEYE][ERROR] joints_all_final.npz must contain 'joints_all' and 'image_names'; aborting.")
-            else:
-                # Robot side: base -> tcp, joints, image names
-                T_base_tcp_all = tcp_npz["T_base_tcp"]                  # (N_tcp, 4, 4)
-                tcp_image_names = [str(n) for n in tcp_npz["image_names"]]
+    joints_all = joints_npz["joints_all"]          # (N,6)
+    image_names_joints = joints_npz["image_names"] # (N,)
 
-                joints_all = joints_npz["joints_all"]                  # (N_tcp, 6) expected
-                joints_image_names = [str(n) for n in joints_npz["image_names"]]
+    # Basic consistency checks
+    if len(image_names_tcp) != len(joints_all):
+        print("[HANDEYE][WARN] image_names length mismatch between T_base_tcp and joints_all.")
+    if not np.array_equal(image_names_tcp, image_names_joints):
+        print("[HANDEYE][WARN] image_names differ between T_base_tcp and joints_all. "
+            "We'll still match by string name.")
 
-                if len(tcp_image_names) != len(joints_image_names):
-                    print("[HANDEYE][WARN] TCP and joints image name counts differ; will align via names.")
+    # --- Build *virtual* ^baseT_hand by freezing q6 in the FK ---
+    Q6_REF = 0.0  # [rad] reference angle for joint 6 in the hand frame
 
-                # Map image name -> index on robot side
-                name_to_idx_robot = {name: i for i, name in enumerate(tcp_image_names)}
+    T_base_hand_list = []
+    for idx, img_name in enumerate(image_names_tcp):
+        q = joints_all[idx]
+        T_bh = fk_base_to_hand_virtual(robot, q, q6_ref=Q6_REF)
+        T_base_hand_list.append(T_bh)
 
-                # --- TEMP: build T_base_hand_all using FK approx (hand ≈ tcp) ---
-                T_base_hand_list = []
-                for i, name in enumerate(tcp_image_names):
-                    T_bt = T_base_tcp_all[i]
-                    q_i = joints_all[i]         # (unused in TEMP FK, but kept for future real FK)
-                    T_bh = fk_base_to_hand_temp(q_i, T_bt)
-                    T_base_hand_list.append(T_bh)
+    T_base_hand_all = np.stack(T_base_hand_list, axis=0)  # (N,4,4)
 
-                T_base_hand_all = np.stack(T_base_hand_list, axis=0)    # (N_tcp, 4, 4)
-                np.savez(
-                    T_HAND_BASE_PATH,
-                    T_base_hand=T_base_hand_all,
-                    image_names=np.array(tcp_image_names),
-                )
-                print(f"[HANDEYE] Saved TEMP T_base_hand (≈T_base_tcp) to {T_HAND_BASE_PATH}")
+    # Save these for diagnostics / later checks
+    np.savez(
+        T_HAND_BASE_PATH,
+        T_base_hand=T_base_hand_all,
+        image_names=image_names_tcp,
+        q6_ref=float(Q6_REF),
+    )
+    print(f"[HANDEYE] Saved virtual T_base_hand (q6 frozen at {Q6_REF:.3f} rad) to {T_HAND_BASE_PATH}")
 
-                # --- Load camera-side board poses: ^cameraT_board ---
-                cb_npz = np.load(T_CAM_BOARD_PATH, allow_pickle=True)
-                print(f"[HANDEYE] {T_CAM_BOARD_PATH.name} keys:", list(cb_npz.keys()))
+    # --- Load vision-side data: ^cameraT_board ---
+    cam_npz = np.load(T_CAM_BOARD_PATH, allow_pickle=True)
+    print("[HANDEYE] T_camera_board_all_final.npz keys:", list(cam_npz.keys()))
+    if "T_camera_board" not in cam_npz or "image_names" not in cam_npz:
+        raise RuntimeError(
+            "[HANDEYE][ERROR] T_camera_board_all_final.npz must contain "
+            "'T_camera_board' and 'image_names'."
+        )
 
-                if "T_camera_board" not in cb_npz or "image_names" not in cb_npz:
-                    print("[HANDEYE][ERROR] T_camera_board_all_final.npz must contain "
-                          "'T_camera_board' and 'image_names'; aborting.")
-                else:
-                    T_camera_board_all = cb_npz["T_camera_board"]      # (N_cb, 4, 4)
-                    board_image_names = [str(n) for n in cb_npz["image_names"]]
+    T_camera_board_all = cam_npz["T_camera_board"]   # (M,4,4)
+    image_names_cam = cam_npz["image_names"]         # (M,)
 
-                    # ---- Pair up robot and vision data via image names ----
-                    R_hand2base = []
-                    t_hand2base = []
-                    R_target2cam = []
-                    t_target2cam = []
-                    used_names = []
+    # --- Build all pose pairs (robot ↔ vision) matched by image name ---
+    name_to_idx_hand = {str(n): i for i, n in enumerate(image_names_tcp)}
+    name_to_idx_cam  = {str(n): i for i, n in enumerate(image_names_cam)}
 
-                    for k, img_name in enumerate(board_image_names):
-                        if img_name not in name_to_idx_robot:
-                            print(f"[HANDEYE][WARN] {img_name} missing on robot side; skipping.")
-                            continue
+    R_gripper2base = []
+    t_gripper2base = []
+    R_target2cam   = []
+    t_target2cam   = []
+    used_names     = []
 
-                        idx_robot = name_to_idx_robot[img_name]
+    for name in image_names_cam:
+        key = str(name)
+        if key not in name_to_idx_hand:
+            print(f"[HANDEYE][WARN] {key} not found in T_base_hand; skipping this view.")
+            continue
 
-                        # Robot side: ^baseT_hand
-                        T_bh = T_base_hand_all[idx_robot]
-                        R_bh = T_bh[:3, :3]
-                        t_bh = T_bh[:3, 3]
+        idx_h = name_to_idx_hand[key]
+        idx_c = name_to_idx_cam[key]
 
-                        # Vision side: ^cameraT_board  (target = board)
-                        T_cb = T_camera_board_all[k]
-                        R_cb = T_cb[:3, :3]
-                        t_cb = T_cb[:3, 3]
+        # Robot side: ^baseT_hand
+        T_bh = T_base_hand_all[idx_h]
+        R_bh = T_bh[:3, :3]
+        t_bh = T_bh[:3, 3]
 
-                        R_hand2base.append(R_bh)
-                        t_hand2base.append(t_bh)
-                        R_target2cam.append(R_cb)
-                        t_target2cam.append(t_cb)
-                        used_names.append(img_name)
+        # Vision side: ^cameraT_board (OpenCV's target→cam is board→cam)
+        T_cb = T_camera_board_all[idx_c]
+        R_tc = T_cb[:3, :3]
+        t_tc = T_cb[:3, 3]
 
-                    num_pairs = len(used_names)
-                    print(f"[HANDEYE] Using {num_pairs} pose pairs for hand–eye.")
+        R_gripper2base.append(R_bh)
+        t_gripper2base.append(t_bh)
+        R_target2cam.append(R_tc)
+        t_target2cam.append(t_tc)
+        used_names.append(key)
 
-                    if num_pairs < 3:
-                        print("[HANDEYE][ERROR] Not enough pose pairs for hand–eye (need >= 3). Skipping.")
-                    else:
-                        R_hand2base = np.array(R_hand2base, dtype=np.float64)
-                        t_hand2base = np.array(t_hand2base, dtype=np.float64)
-                        R_target2cam = np.array(R_target2cam, dtype=np.float64)
-                        t_target2cam = np.array(t_target2cam, dtype=np.float64)
+    R_gripper2base = np.array(R_gripper2base, dtype=np.float64)
+    t_gripper2base = np.array(t_gripper2base, dtype=np.float64)
+    R_target2cam   = np.array(R_target2cam,   dtype=np.float64)
+    t_target2cam   = np.array(t_target2cam,   dtype=np.float64)
 
-                        # --- Call OpenCV hand–eye (Tsai) ---
-                        R_cam2hand, t_cam2hand = cv2.calibrateHandEye(
-                            R_hand2base, t_hand2base,
-                            R_target2cam, t_target2cam,
-                            method=cv2.CALIB_HAND_EYE_TSAI,
-                        )
+    print(f"[HANDEYE] Using {len(used_names)} pose pairs for hand–eye.")
 
-                        # According to OpenCV naming, this is cam->hand = ^handT_camera
-                        T_hand_camera = np.eye(4, dtype=np.float64)
-                        T_hand_camera[:3, :3] = R_cam2hand
-                        T_hand_camera[:3, 3]  = t_cam2hand.reshape(3)
+    if len(used_names) < 5:
+        print("[HANDEYE][WARN] Very few pose pairs for hand–eye; result may be unstable.")
 
-                        norm_t = np.linalg.norm(t_cam2hand)
-                        print("[HANDEYE] ^handT_camera (Tsai, TEMP hand≈tcp):")
-                        print(T_hand_camera)
-                        print("[HANDEYE] Translation (m):", t_cam2hand.ravel())
-                        print(f"[HANDEYE] ||t|| = {norm_t:.4f} m")
+    # --- Run OpenCV Tsai hand–eye: returns cam→hand (i.e. ^handT_camera) ---
+    R_cam2hand, t_cam2hand = cv2.calibrateHandEye(
+        R_gripper2base, t_gripper2base,
+        R_target2cam,  t_target2cam,
+        method=cv2.CALIB_HAND_EYE_TSAI,
+    )
 
-                        # Save for diagnostics
-                        np.savez(
-                            HE_HAND_EYE_PATH,
-                            T_hand_camera=T_hand_camera,
-                            R_hand_camera=T_hand_camera[:3, :3],
-                            t_hand_camera=T_hand_camera[:3, 3],
-                            used_image_names=np.array(used_names),
-                            method="TSAI",
-                            rms_intrinsics=float(rms),
-                        )
-                        print(f"[HANDEYE] Saved hand–eye result to {HE_HAND_EYE_PATH}")
+    T_hand_camera = np.eye(4, dtype=np.float64)
+    T_hand_camera[:3, :3] = R_cam2hand
+    T_hand_camera[:3, 3]  = t_cam2hand.reshape(3)
+
+    norm_t = np.linalg.norm(t_cam2hand)
+    print("[HANDEYE] ^handT_camera (Tsai, virtual hand with q6 frozen):")
+    print(T_hand_camera)
+    print("[HANDEYE] Translation (m):", t_cam2hand.ravel())
+    print(f"[HANDEYE] ||t|| = {norm_t:.4f} m")
+
+    # Save final hand–eye result
+    np.savez(
+        HE_HAND_EYE_PATH,
+        T_hand_camera=T_hand_camera,
+        R_hand_camera=T_hand_camera[:3, :3],
+        t_hand_camera=T_hand_camera[:3, 3],
+        used_image_names=np.array(used_names),
+        method="TSAI",
+        rms_intrinsics=float(rms),
+        q6_ref=float(Q6_REF),
+    )
+    print(f"[HANDEYE] Saved hand–eye result to {HE_HAND_EYE_PATH}")
+
 
 
