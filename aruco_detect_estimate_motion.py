@@ -21,7 +21,6 @@ We will use the run: run_20251211_153839 from calibration_data_charuco/
 """
 
 import time
-import json
 from pathlib import Path
 import datetime
 
@@ -48,6 +47,10 @@ Q6_REF = 0.0
 ARUCO_DICT_ID = cv2.aruco.DICT_4X4_50
 TARGET_ID = 0
 MARKER_LEN_M = 0.026
+
+# log folder to not pollute the calibration run
+LOG_DIR = Path("aruco_logs") / datetime.datetime.now().strftime("run_%Y%m%d_%H%M%S")
+LOG_DIR.mkdir(parents=True, exist_ok=True)
 
 # ---helpers---
 def load_intrinsics(run_dir: Path):
@@ -135,7 +138,16 @@ def fk_base_to_hand_virtual(robot, joints, q6_ref=0.0):
     T_hand = niryo_pose_to_matrix_from_obj(pose_fk)
     return T_hand
 
-def live_marker_detection(cap, detector, target_id=0):
+def T_from_rvec_tvec(rvec, tvec):
+    R, _ = cv2.Rodrigues(rvec)
+    T = np.eye(4, dtype=float)
+    T[:3, :3] = R
+    T[:3, 3] = tvec.reshape(3)
+    return T
+
+def live_marker_detection(cap, detector, K, dist, marker_len_m,
+                          robot, T_hand_camera, q6_ref, log_dir,
+                          target_id=0, overlay_base_pose=False):
     aruco = cv2.aruco
     print("\n[INFO] Step5: Live ArUco detection (raw frame)")
     print("       Keys: [q]=quit, [s]=snapshot print IDs")
@@ -144,6 +156,9 @@ def live_marker_detection(cap, detector, target_id=0):
     fps = 0.0
 
     while True:
+        ok_pnp = False
+        rvec = None
+        tvec = None
         ok, frame = cap.read()
         if not ok:
             print("[WARN] Camera read failed")
@@ -166,6 +181,35 @@ def live_marker_detection(cap, detector, target_id=0):
         if ids is not None:
             aruco.drawDetectedMarkers(vis, corners, ids)
 
+        # ==================================================
+        # Step 6: Pose estimation (ID=target_id) + draw axes
+        # ==================================================
+        if ids is not None and target_id in ids_list:
+            i = ids_list.index(target_id)  # take the first match
+            img_pts = corners[i].reshape(4, 2).astype(np.float32)
+
+            L = float(marker_len_m)
+            obj_pts = np.array([
+                [-L/2,  L/2, 0],
+                [ L/2,  L/2, 0],
+                [ L/2, -L/2, 0],
+                [-L/2, -L/2, 0],
+            ], dtype=np.float32)
+
+            ok_pnp, rvec, tvec = cv2.solvePnP(
+                obj_pts, img_pts, K, dist,
+                flags=cv2.SOLVEPNP_IPPE_SQUARE
+            )
+
+            if ok_pnp:
+                # Draw XYZ axes on the marker
+                cv2.drawFrameAxes(vis, K, dist, rvec, tvec, L * 1.5, 2)
+
+                # Optional: show tvec on screen (meters)
+                tv = tvec.reshape(3)
+                cv2.putText(vis, f"tvec=[{tv[0]:.3f},{tv[1]:.3f},{tv[2]:.3f}] m",
+                            (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 2, cv2.LINE_AA)
+
         # Small “health line”
         overlay = f"fps={fps:.1f}  ids={ids_list}  rejected={rejected_n}  target={target_id}"
         cv2.putText(vis, overlay, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.75,
@@ -173,14 +217,37 @@ def live_marker_detection(cap, detector, target_id=0):
         cv2.putText(vis, overlay, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.75,
                     (255, 255, 255), 1, cv2.LINE_AA)
 
-        cv2.imshow("Step5 - ArUco detect (raw)", vis)
+        cv2.imshow("Step5+6 - ArUco detect (raw) + pose", vis)
         key = cv2.waitKey(1) & 0xFF
 
         if key == ord("q"):
             break
 
         if key == ord("s"):
-            print(f"[SNAPSHOT] ids={ids_list} | rejected={rejected_n}")
+            stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
+
+            # Always save images for debugging
+            cv2.imwrite(str(log_dir / f"{stamp}_raw.png"), frame)
+            cv2.imwrite(str(log_dir / f"{stamp}_vis.png"), vis)
+
+            msg = f"[SNAPSHOT] ids={ids_list} | rejected={rejected_n}"
+
+            if ok_pnp:
+                # robot FK at snapshot time
+                joints_now = robot.get_joints()
+                T_base_hand = fk_base_to_hand_virtual(robot, joints_now, q6_ref=q6_ref)
+
+                T_cam_marker = T_from_rvec_tvec(rvec, tvec)
+                T_base_marker = T_base_hand @ T_hand_camera @ T_cam_marker
+
+                p = T_base_marker[:3, 3]
+                msg += f" | tvec_cam(m)=[{tvec[0][0]:.3f},{tvec[1][0]:.3f},{tvec[2][0]:.3f}]"
+                msg += f" | base_xyz(m)=[{p[0]:.4f},{p[1]:.4f},{p[2]:.4f}]"
+
+                # optional: save transform
+                np.savez(str(log_dir / f"{stamp}_T_base_marker.npz"), T_base_marker=T_base_marker, joints=joints_now)
+
+            print(msg)
     cv2.destroyAllWindows()
 
 # ================================================
@@ -278,7 +345,19 @@ print("[INFO] ||t_hand_camera|| =", float(np.linalg.norm(T_hand_camera[:3, 3])))
 # Step 5: Live ArUco marker detection
 # ===================================
 detector = make_aruco_detector()
-live_marker_detection(cap, detector, target_id=TARGET_ID)
+live_marker_detection(cap, detector, K, dist, MARKER_LEN_M,
+                      robot, T_hand_camera, Q6_REF, LOG_DIR,
+                      target_id=TARGET_ID, overlay_base_pose=False)
 
 cap.release()
 robot.close_connection()
+
+# ==================================================
+# Step 6: Pose estimation (ID=target_id) + draw axes
+# ==================================================
+# --> Implementation in the Step5 helper live loop!
+# In def live_marker_detection(cap, detector, K, dist, marker_len_m, target_id=0)
+
+# ====================
+# Step 7: 
+# ====================
