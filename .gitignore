@@ -1,0 +1,24 @@
+# Python bytecode
+__pycache__/
+*.pyc
+*.pyo
+
+# Virtual environment
+.venv/
+
+# Results / binary artifacts
+*.npz
+*.npy
+
+# Generated figures / markers
+ChArUco_Marker.png
+*.png
+
+# IDE settings
+.idea/
+.vscode/
+
+# Big calibration & debug data (regeneratable)
+calibration_data/
+calibration_data_charuco/
+debug_snaps/
