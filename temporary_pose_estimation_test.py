@@ -41,7 +41,15 @@ FRAME_HEIGHT = 1080
 SHOW_PREVIEW = True
 
 # Fixed observation pose
-OBS_JOINTS = [0.2717, 0.4843, -0.9719, -0.0137, -0.9972, 0.2670]
+OBS_JOINTS_1 = [0.2717, 0.4843, -0.9719, -0.0137, -0.9972, 0.2670]
+
+# Extra viewpoints (try to keep q6 the same if possible; q6 doesn't change the camera much in your setup)
+OBS_JOINTS_2 = [-0.2411, 0.4585, -0.9961, -0.0674, -1.0186, 0.2670]
+OBS_JOINTS_3 = [-0.7723, 0.4115, -0.9627, -0.0720, -1.0140, 0.2670]
+
+OBS_VIEWS = [OBS_JOINTS_1, OBS_JOINTS_2, OBS_JOINTS_3]
+PRIMARY_OBS = OBS_JOINTS_1
+
 Q6_REF = 0.0
 
 ARUCO_DICT_ID = cv2.aruco.DICT_4X4_50
@@ -51,6 +59,18 @@ MARKER_LEN_M = 0.026
 # log folder to not pollute the calibration run
 LOG_DIR = Path("aruco_logs") / datetime.datetime.now().strftime("run_%Y%m%d_%H%M%S")
 LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+# --- motion check config ---
+DO_MOVE_ON_SNAPSHOT = True          # set False for dry-run
+Z_HOVER = 0.05                      # 5 cm above marker
+Z_MIN   = 0.03                      # never go below 3 cm
+Z_SAFE  = 0.12                      # safe travel height
+# rough workspace bounds (adjust if you want)
+X_MIN, X_MAX = 0.12, 0.45
+Y_MIN, Y_MAX = -0.25, 0.25
+
+RETURN_TO_OBS = True
+HOVER_PAUSE_S = 0.2
 
 # ---helpers---
 def load_intrinsics(run_dir: Path):
@@ -93,6 +113,131 @@ def rpy_to_rot_matrix(rpy):
     # Apply rotations in order: roll → pitch → yaw
     R = Rz @ Ry @ Rx
     return R
+
+def estimate_marker_once(frame_bgr, detector, K, dist, marker_len_m, target_id):
+    aruco = cv2.aruco
+    gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+    corners, ids, rejected = detector.detectMarkers(gray)
+
+    if ids is None:
+        return None
+
+    ids_list = ids.ravel().tolist()
+    if target_id not in ids_list:
+        return None
+
+    i = ids_list.index(target_id)
+    img_pts = corners[i].reshape(4, 2).astype(np.float32)
+
+    L = float(marker_len_m)
+    obj_pts = np.array([
+        [-L/2,  L/2, 0],
+        [ L/2,  L/2, 0],
+        [ L/2, -L/2, 0],
+        [-L/2, -L/2, 0],
+    ], dtype=np.float32)
+
+    ok, rvec, tvec = cv2.solvePnP(obj_pts, img_pts, K, dist, flags=cv2.SOLVEPNP_IPPE_SQUARE)
+    if not ok:
+        return None
+
+    # pixel-area of marker (bigger = usually better)
+    area = float(abs(cv2.contourArea(img_pts)))
+
+    # reprojection error (smaller = better)
+    proj, _ = cv2.projectPoints(obj_pts, rvec, tvec, K, dist)
+    proj = proj.reshape(-1, 2)
+    reproj_err = float(np.mean(np.linalg.norm(proj - img_pts, axis=1)))
+
+    rejected_n = 0 if rejected is None else len(rejected)
+
+    return dict(rvec=rvec, tvec=tvec, area=area, reproj_err=reproj_err,
+                ids_list=ids_list, rejected_n=rejected_n)
+
+def multiview_best_pose(robot, cap, detector, K, dist, marker_len_m,
+                        T_hand_camera, q6_ref, target_id, log_dir, obs_views):
+    best = None
+
+    for k, q in enumerate(obs_views):
+        robot.move_joints(q)          # ok (deprecated warning is fine for now)
+        time.sleep(0.25)
+
+        # flush a few frames after motion
+        for _ in range(3):
+            cap.grab()
+        ok, frame = cap.read()
+        if not ok:
+            continue
+
+        est = estimate_marker_once(frame, detector, K, dist, marker_len_m, target_id)
+        if est is None:
+            continue
+
+        joints_now = robot.get_joints()
+        T_base_hand = fk_base_to_hand_virtual(robot, joints_now, q6_ref=q6_ref)
+        T_cam_marker = T_from_rvec_tvec(est["rvec"], est["tvec"])
+        T_base_marker = T_base_hand @ T_hand_camera @ T_cam_marker
+
+        # debug image with axes
+        vis = frame.copy()
+        cv2.drawFrameAxes(vis, K, dist, est["rvec"], est["tvec"], float(marker_len_m) * 1.5, 2)
+
+        stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
+        cv2.imwrite(str(log_dir / f"{stamp}_view{k}_raw.png"), frame)
+        cv2.imwrite(str(log_dir / f"{stamp}_view{k}_vis.png"), vis)
+        np.savez(str(log_dir / f"{stamp}_view{k}_T_base_marker.npz"),
+                 T_base_marker=T_base_marker,
+                 joints=joints_now,
+                 area=est["area"],
+                 reproj_err=est["reproj_err"])
+
+        # choose best: max area, tie-break min reproj_err
+        key = (-est["area"], est["reproj_err"])
+        if (best is None) or (key < best["key"]):
+            best = dict(key=key, est=est, T_base_marker=T_base_marker)
+
+    return best  # None if no valid view
+
+def make_aruco_detector():
+    aruco = cv2.aruco
+    dictionary = aruco.getPredefinedDictionary(ARUCO_DICT_ID)
+    params = aruco.DetectorParameters()
+
+    # ✅ Subpixel corner refinement
+    params.cornerRefinementMethod = aruco.CORNER_REFINE_SUBPIX
+    params.cornerRefinementWinSize = 5          # try 5 or 7
+    params.cornerRefinementMaxIterations = 30
+    params.cornerRefinementMinAccuracy = 0.01
+
+    return aruco.ArucoDetector(dictionary, params)
+
+
+def in_bounds(x, y, z):
+    return (X_MIN <= x <= X_MAX) and (Y_MIN <= y <= Y_MAX) and (z >= 0.0)
+
+def move_hover_above(robot, x, y, z_hover, rpy_fixed):
+    """
+    Safe 3-step move: lift -> move XY at safe Z -> descend to hover Z.
+    """
+    # clamp hover height
+    z_hover = max(float(z_hover), Z_MIN)
+    z_travel = max(Z_SAFE, z_hover)
+
+    if not in_bounds(x, y, z_hover):
+        print(f"[MOVE][SKIP] target out of bounds: x={x:.3f}, y={y:.3f}, z={z_hover:.3f}")
+        return
+
+    roll, pitch, yaw = rpy_fixed
+
+    # 1) lift where you are (same XY, up to z_travel)
+    p = robot.get_pose()
+    robot.move(pyn.PoseObject(p.x, p.y, z_travel, roll, pitch, yaw))
+
+    # 2) travel in XY at z_travel
+    robot.move(pyn.PoseObject(x, y, z_travel, roll, pitch, yaw))
+
+    # 3) descend to hover
+    robot.move(pyn.PoseObject(x, y, z_hover, roll, pitch, yaw))
 
 def niryo_pose_to_matrix_from_obj(pose):
     """
@@ -226,28 +371,56 @@ def live_marker_detection(cap, detector, K, dist, marker_len_m,
         if key == ord("s"):
             stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
 
-            # Always save images for debugging
-            cv2.imwrite(str(log_dir / f"{stamp}_raw.png"), frame)
-            cv2.imwrite(str(log_dir / f"{stamp}_vis.png"), vis)
+            # (optional) save what you currently see in the live window
+            cv2.imwrite(str(log_dir / f"{stamp}_LIVE_raw.png"), frame)
+            cv2.imwrite(str(log_dir / f"{stamp}_LIVE_vis.png"), vis)
 
-            msg = f"[SNAPSHOT] ids={ids_list} | rejected={rejected_n}"
+            best = None
+            try:
+                best = multiview_best_pose(
+                    robot, cap, detector, K, dist, marker_len_m,
+                    T_hand_camera, q6_ref, target_id, log_dir, OBS_VIEWS
+                )
+            finally:
+                # always go back
+                if RETURN_TO_OBS:
+                    robot.move_joints(PRIMARY_OBS)
+                    time.sleep(0.2)
 
-            if ok_pnp:
-                # robot FK at snapshot time
-                joints_now = robot.get_joints()
-                T_base_hand = fk_base_to_hand_virtual(robot, joints_now, q6_ref=q6_ref)
+            if best is None:
+                print("[SNAPSHOT] Multi-view: target not found in any view.")
+                continue
 
-                T_cam_marker = T_from_rvec_tvec(rvec, tvec)
-                T_base_marker = T_base_hand @ T_hand_camera @ T_cam_marker
+            T_base_marker = best["T_base_marker"]
+            p = T_base_marker[:3, 3]
+            x_m, y_m, z_m = float(p[0]), float(p[1]), float(p[2])
+            z_hover = z_m + Z_HOVER
 
-                p = T_base_marker[:3, 3]
-                msg += f" | tvec_cam(m)=[{tvec[0][0]:.3f},{tvec[1][0]:.3f},{tvec[2][0]:.3f}]"
-                msg += f" | base_xyz(m)=[{p[0]:.4f},{p[1]:.4f},{p[2]:.4f}]"
+            est = best["est"]
+            print(f"[BEST] reproj_err={est['reproj_err']:.3f}px area={est['area']:.0f}px^2 "
+                f"tvec_cam=[{est['tvec'][0][0]:.3f},{est['tvec'][1][0]:.3f},{est['tvec'][2][0]:.3f}]")
 
-                # optional: save transform
-                np.savez(str(log_dir / f"{stamp}_T_base_marker.npz"), T_base_marker=T_base_marker, joints=joints_now)
+            print(f"[MOVE] base_xyz={x_m:.4f},{y_m:.4f},{z_m:.4f} -> hover_z={z_hover:.4f}")
 
-            print(msg)
+            # optional: save the final chosen best transform too
+            np.savez(str(log_dir / f"{stamp}_BEST_T_base_marker.npz"),
+                     T_base_marker=T_base_marker,
+                     reproj_err=est["reproj_err"],
+                     area=est["area"])
+            
+            if DO_MOVE_ON_SNAPSHOT:
+                try:
+                    robot.open_gripper()
+                except Exception:
+                    pass
+
+                move_hover_above(robot, x_m, y_m, z_hover, OBS_RPY)
+                time.sleep(HOVER_PAUSE_S)
+
+                if RETURN_TO_OBS:
+                    robot.move_joints(PRIMARY_OBS)
+                    time.sleep(0.2)
+
     cv2.destroyAllWindows()
 
 # ================================================
@@ -267,13 +440,15 @@ except Exception:
     pass
 
 # Move to a fixed observation pose
-robot.move(pyn.JointsPosition(*OBS_JOINTS))
+robot.move(pyn.JointsPosition(*OBS_JOINTS_1))
 time.sleep(0.3)       # small settle time
 
-print("[INFO] OBS_JOINTS =", np.round(OBS_JOINTS, 4).tolist())
+print("[INFO] OBS_JOINTS =", np.round(OBS_JOINTS_1, 4).tolist())
 print("[INFO] joints (actual)        =", np.round(robot.get_joints(), 4).tolist())
 
 pose_live = robot.get_pose()
+OBS_RPY = (pose_live.roll, pose_live.pitch, pose_live.yaw)
+print("[INFO] OBS_RPY =", np.round(OBS_RPY, 4))
 print(
     "[INFO] Robot moved to OBS pose: "
     f"x={pose_live.x:.4f}, y={pose_live.y:.4f}, z={pose_live.z:.4f}, "
