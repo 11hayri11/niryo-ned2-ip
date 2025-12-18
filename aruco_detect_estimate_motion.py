@@ -65,8 +65,9 @@ USE_MULTIVIEW_ON_SNAPSHOT = True
 OBS_JOINTS_1 = [0.2717, 0.4843, -0.9719, -0.0137, -0.9972, 0.2670]
 OBS_JOINTS_2 = [-0.2411, 0.4585, -0.9961, -0.0674, -1.0186, -0.2315]
 OBS_JOINTS_3 = [-0.7723, 0.4115, -0.9627, -0.0720, -1.0140, -0.7761]
+OBS_JOINTS_4 = [0.7754, 0.1661, -0.8218, 0.0507, -1.1122, 0.5707]
 
-OBS_VIEWS   = [OBS_JOINTS_1, OBS_JOINTS_2, OBS_JOINTS_3]
+OBS_VIEWS   = [OBS_JOINTS_1, OBS_JOINTS_2, OBS_JOINTS_3, OBS_JOINTS_4]
 PRIMARY_OBS = OBS_JOINTS_1
 
 SETTLE_S = 0.40
@@ -105,6 +106,8 @@ DO_LIFT_AFTER_PICK = True
 GRIPPER_CLOSE_PAUSE_S = 0.25   # small settle after closing
 Z_LIFT_OFFSET = 0.06           # lift 6cm after grasp (tune)
 LIFT_PAUSE_S = 0.3
+
+FLUSH_AFTER_MOVE = 12   # 8–20 is typical
 
 # ---helpers---
 def load_intrinsics(run_dir: Path):
@@ -155,6 +158,11 @@ def rpy_to_rot_matrix(rpy):
     # Apply rotations in order: roll → pitch → yaw
     R = Rz @ Ry @ Rx
     return R
+
+def flush_camera(cap, n=10):
+    """Drop buffered frames so the next cap.read() is 'now'."""
+    for _ in range(int(n)):
+        cap.grab()
 
 def lift_after_pick(robot, x, y, z_lift, rpy_fixed):
     roll, pitch, yaw = rpy_fixed
@@ -220,6 +228,11 @@ def estimate_marker_once(frame_bgr, detector, K, dist, marker_len_m, target_id):
     i = ids_list.index(target_id)
     img_pts = corners[i].reshape(4, 2).astype(np.float32)
 
+    # ✅ ADD THIS BLOCK (center distance to image center)
+    h, w = gray.shape[:2]
+    center_uv = img_pts.mean(axis=0)  # (u,v)
+    center_dist = float(np.linalg.norm(center_uv - np.array([w/2, h/2], dtype=np.float32)))
+
     L = float(marker_len_m)
     obj_pts = np.array([
         [-L/2,  L/2, 0],
@@ -235,10 +248,8 @@ def estimate_marker_once(frame_bgr, detector, K, dist, marker_len_m, target_id):
     if not ok_pnp:
         return None
 
-    # marker pixel area (proxy for “more pixels / closer / sharper”)
     area = float(cv2.contourArea(img_pts.astype(np.float32)))
 
-    # reprojection error (px)
     proj, _ = cv2.projectPoints(obj_pts, rvec, tvec, K, dist)
     proj = proj.reshape(-1, 2)
     err = np.linalg.norm(proj - img_pts, axis=1)
@@ -246,7 +257,10 @@ def estimate_marker_once(frame_bgr, detector, K, dist, marker_len_m, target_id):
 
     return {
         "rvec": rvec, "tvec": tvec,
-        "area": area, "reproj_err": reproj_err,
+        "area": area,
+        "reproj_err": reproj_err,
+        "center_dist": center_dist,   # ✅ ADD THIS FIELD
+        "center_uv": center_uv,       # optional, but handy for debug prints
     }
 
 def move_to_joints(robot, q):
@@ -302,7 +316,7 @@ def multiview_best_pose(robot, cap, detector, K, dist, marker_len_m,
                   f"base_xyz=[{p[0]:.4f},{p[1]:.4f},{p[2]:.4f}]")
 
         # key: min reproj_err, tie-break max area
-        key = (est["reproj_err"], -est["area"])
+        key = (est["reproj_err"], -est["area"], est["center_dist"])
         candidates.append(dict(
             key=key, est=est, T_base_marker=T_base_marker, p=p, view_idx=k, joints=joints_now
         ))
@@ -481,7 +495,8 @@ def live_marker_detection(cap, detector, K, dist, marker_len_m,
                 finally:
                     # Always return to primary obs
                     move_to_joints(robot, PRIMARY_OBS)
-                    time.sleep(0.2)
+                    time.sleep(SETTLE_S)
+                    flush_camera(cap, FLUSH_AFTER_MOVE)
 
                 if best is None:
                     print("[SNAPSHOT] Multi-view: target not found in any view.")
@@ -518,64 +533,67 @@ def live_marker_detection(cap, detector, K, dist, marker_len_m,
                 # NEW: hover test motion
                 # ----------------------
                 if DO_MOVE_ON_SNAPSHOT:
+                    z_pick = None
+
+                    # --- PICK ---
                     try:
                         robot.open_gripper()
                     except Exception:
                         pass
 
-                    # 1) hover
                     ok_move = move_hover_above(robot, x_m, y_m, z_hover, OBS_RPY)
-                    if ok_move:
-                        time.sleep(HOVER_PAUSE_S) # inspect here for crash!
+                    if not ok_move:
+                        print("[MOVE] hover skipped -> skip pick/place")
+                        continue
 
-                        # 2) descend to pick height
-                        z_pick = compute_pick_z(z_m)
-                        print(f"[PICK] z_m={z_m:.4f} -> z_pick={z_pick:.4f}")
-                        descend_to_pick(robot, x_m, y_m, z_pick, OBS_RPY, z_pre_offset=Z_PRE_OFFSET)
+                    time.sleep(HOVER_PAUSE_S)
 
-                        time.sleep(PICK_PAUSE_S)
+                    z_pick = compute_pick_z(z_m)
+                    print(f"[PICK] z_m={z_m:.4f} -> z_pick={z_pick:.4f}")
+                    descend_to_pick(robot, x_m, y_m, z_pick, OBS_RPY, z_pre_offset=Z_PRE_OFFSET)
+                    time.sleep(PICK_PAUSE_S)
 
-                        # 3) close gripper
-                        if DO_CLOSE_GRIPPER_ON_PICK:
-                            try:
-                                robot.close_gripper()
-                            except Exception:
-                                pass
-                            time.sleep(GRIPPER_CLOSE_PAUSE_S)
+                    if DO_CLOSE_GRIPPER_ON_PICK:
+                        try:
+                            robot.close_gripper()
+                        except Exception:
+                            pass
+                        time.sleep(GRIPPER_CLOSE_PAUSE_S)
 
-                        # 4) lift up
-                        if DO_LIFT_AFTER_PICK:
-                            z_lift = max(float(z_hover), float(z_pick) + float(Z_LIFT_OFFSET))
-                            print(f"[LIFT] z_pick={z_pick:.4f} -> z_lift={z_lift:.4f}")
-                            lift_after_pick(robot, x_m, y_m, z_lift, OBS_RPY)
-                            time.sleep(LIFT_PAUSE_S)
+                    if DO_LIFT_AFTER_PICK:
+                        z_lift = max(float(z_hover), float(z_pick) + float(Z_LIFT_OFFSET))
+                        print(f"[LIFT] z_pick={z_pick:.4f} -> z_lift={z_lift:.4f}")
+                        lift_after_pick(robot, x_m, y_m, z_lift, OBS_RPY)
+                        time.sleep(LIFT_PAUSE_S)
 
-                    if RETURN_TO_OBS_AFTER_MOVE:
-                        move_to_joints(robot, PRIMARY_OBS)
-                        time.sleep(0.2)
+                    # --- BACK TO OBS (required before placing) ---
+                    move_to_joints(robot, PRIMARY_OBS)
+                    time.sleep(SETTLE_S)
+                    flush_camera(cap, FLUSH_AFTER_MOVE)
 
-                    # 1) PLACE BACK at the same pick xy
+                    # --- PLACE BACK (same XY) ---
                     print(f"[PLACE] back to same xy, z_pick={z_pick:.4f}, z_hover={z_hover:.4f}")
 
-                    # go hover above the same position
                     move_hover_above(robot, x_m, y_m, z_hover, OBS_RPY)
                     time.sleep(HOVER_PAUSE_S)
 
-                    # descend to place height (reuse your descend function)
                     descend_to_pick(robot, x_m, y_m, z_pick, OBS_RPY, z_pre_offset=Z_PRE_OFFSET)
                     time.sleep(0.2)
 
-                    # release
-                    robot.open_gripper()
+                    try:
+                        robot.open_gripper()
+                    except Exception:
+                        pass
                     time.sleep(0.2)
 
-                    # lift back up
-                    move_hover_above(robot, x_m, y_m, z_hover, OBS_RPY)
-                    time.sleep(0.2)
+                    """ move_hover_above(robot, x_m, y_m, z_hover, OBS_RPY)
+                    time.sleep(0.2) """
 
-                    # back to OBS again
+                    # --- BACK TO OBS again ---
                     move_to_joints(robot, PRIMARY_OBS)
-                    time.sleep(0.2)
+                    time.sleep(SETTLE_S)
+                    flush_camera(cap, FLUSH_AFTER_MOVE)
+
                 continue
 
             # ----------------------------------------
@@ -674,7 +692,7 @@ he_path   = RUN_DIR / "handeye_charuco_hand_TSAI.npz"
 
 intr = np.load(intr_path, allow_pickle=True)
 K = intr["K"].astype(np.float64)
-dist = intr["dist"].reshape(-1).astype(np.float64).astype(np.float64)
+dist = intr["dist"].reshape(-1).astype(np.float64)
 
 print("[INFO] Loaded intrinsics:", intr_path)
 print("[INFO] K:\n", K)
