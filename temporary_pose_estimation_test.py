@@ -33,7 +33,7 @@ import pyniryo as pyn
 # ========================
 # ---Configs---
 ROBOT_IP = "129.187.231.226"
-RUN_DIR = Path("calibration_data_charuco/run_20251211_153839")
+RUN_DIR = Path("calibration_data_charuco") / "run_20260113_144602"
 
 CAMERA_INDEX = 0
 FRAME_WIDTH = 1920

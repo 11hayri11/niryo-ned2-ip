@@ -2,7 +2,7 @@ import numpy as np
 from pathlib import Path
 
 # ====== CONFIG: set this to the run you want to analyze ======
-RUN_DIR = Path("calibration_data_charuco/run_20251211_153839")
+RUN_DIR = Path("calibration_data_charuco/run_20260113_144602")
 # =============================================================
 
 T_HAND_PATH      = RUN_DIR / "T_base_hand_all_final.npz"
