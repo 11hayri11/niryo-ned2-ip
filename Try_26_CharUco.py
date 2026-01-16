@@ -76,8 +76,10 @@ SNAP_SAVE_NPZ          = True
 
 # Step 8: Motion configs ------------------------
 ENABLE_MOTION = True
-MOTION_KEY = "m"                 # press to execute pick+place-back once
-ACTIVE_ID_FOR_MOTION = 0         # keep simple: only one marker in frame (id 0) for first tests
+MOTION_KEY = "p"                 # press to execute pick+place-back once
+MOTION_SELECT_MODE = "best"
+ACTIVE_ID_FOR_MOTION = 0
+MANUAL_ID_FOR_MOTION = 0
 
 CUBE_HALF_M = 0.0185             # 37mm cube -> half
 PICK_PAD_M  = 0.0020             # small pad above mid-height
@@ -98,6 +100,8 @@ MV_REPROJ_MAX_PX = 0.35          # candidate gate across views (can reuse SNAP_R
 MV_MEAN_AREA_MIN = 4500          # candidate gate across views
 MV_MAXDEV_MAX_MM = 2.5           # optional: reject “jittery” views
 MV_SPREAD_MAX_MM = 15.0          # optional: if views disagree too much -> warn/abort for motion
+MV_SPREAD_PRIORITIZE_REPROJ_MM = 6.0   # if cross-view disagreement > this, prefer reproj/area over consensus
+MV_DEBUG_CHOICE = False               # set True to print ranking diagnostics
 
 # helper ---------
 def load_intrinsics(run_dir: Path):
@@ -290,23 +294,49 @@ def snapshot_one_view(cap, detector, K, dist, marker_len_m,
 
 def choose_multiview_candidate(cands):
     """
-    cands: list of result dicts (each already has median_xyz, mean_reproj, mean_area, etc.)
+    cands: list of result dicts (each already has median_xyz, mean_reproj, mean_area, max_dev_mm, etc.)
     Returns: chosen dict, spread_mm
     """
     meds = np.array([c["median_xyz"] for c in cands], dtype=float)
     med_of_meds = np.median(meds, axis=0)
-    dists = np.linalg.norm(meds - med_of_meds[None, :], axis=1)
 
-    spread_mm = float(np.max(dists) * 1000.0) if len(dists) else float("inf")
+    dists_m = np.linalg.norm(meds - med_of_meds[None, :], axis=1)
+    dists_mm = dists_m * 1000.0
+    spread_mm = float(np.max(dists_mm)) if len(dists_mm) else float("inf")
 
-    # pick closest to median-of-medians, tie-break by reproj then area
-    idxs = np.argsort(dists)
-    best = None
-    for idx in idxs:
-        best = cands[idx]
-        break
-    return best, spread_mm
+    # Build a sortable key per candidate (smaller is better).
+    # Switch strategy depending on how much the views disagree.
+    quality_first = (spread_mm > MV_SPREAD_PRIORITIZE_REPROJ_MM)
 
+    keys = []
+    for i, c in enumerate(cands):
+        reproj = float(c.get("mean_reproj", 1e9))
+        area   = float(c.get("mean_area", 0.0))
+        maxdev = float(c.get("max_dev_mm", 1e9))
+        dist   = float(dists_mm[i])
+
+        if quality_first:
+            # Prefer best pose quality; consensus only as late tie-break.
+            key = (reproj, -area, maxdev, dist)
+        else:
+            # Prefer consensus; still use quality as tie-break.
+            key = (dist, reproj, -area, maxdev)
+
+        keys.append(key)
+
+    best_idx = int(np.argmin(np.array(keys, dtype=object)))  # works with tuples
+
+    if MV_DEBUG_CHOICE:
+        mode = "QUALITY_FIRST" if quality_first else "CONSENSUS_FIRST"
+        print(f"[CHOOSE] mode={mode} spread_mm={spread_mm:.1f}")
+        order = sorted(range(len(cands)), key=lambda i: keys[i])
+        for rank, i in enumerate(order[:min(5, len(order))]):
+            c = cands[i]
+            print(f"  rank={rank} view={c.get('view_index')} key={keys[i]} "
+                  f"reproj={c.get('mean_reproj'):.3f}px area={c.get('mean_area'):.0f} "
+                  f"maxdev={c.get('max_dev_mm'):.2f}mm dist={dists_mm[i]:.1f}mm")
+
+    return cands[best_idx], spread_mm
 
 def multiview_snapshot(robot, cap, detector, K, dist, marker_len_m,
                       T_hand_camera, q6_ref,
@@ -392,6 +422,45 @@ def multiview_snapshot(robot, cap, detector, K, dist, marker_len_m,
             print(f"[MULTIVIEW][WARN] id={mid}: view disagreement spread={spread_mm:.1f}mm > {MV_SPREAD_MAX_MM}mm")
 
     return last_snapshot_result
+
+def choose_pick_id_for_motion(last_snapshot_result, mode, active_id, manual_id):
+    """
+    last_snapshot_result: dict mid -> {
+        "mean_reproj", "mean_area", "max_dev_mm", "n", ...
+    }
+    Returns: (pick_id, reason_str)
+    """
+    if not last_snapshot_result:
+        return None, "no snapshot stored"
+
+    ids = sorted(last_snapshot_result.keys())
+    if len(ids) == 1:
+        return ids[0], "only one stored"
+
+    mode = str(mode).lower().strip()
+
+    if mode == "manual":
+        if manual_id in last_snapshot_result:
+            return manual_id, f"manual id={manual_id}"
+        return None, f"manual id={manual_id} not stored"
+
+    if mode == "active":
+        if active_id in last_snapshot_result:
+            return active_id, f"active id={active_id}"
+        return None, f"active id={active_id} not stored"
+
+    # default: "best"
+    def score(mid):
+        d = last_snapshot_result[mid]
+        mean_reproj = float(d.get("mean_reproj", 1e9))
+        mean_area   = float(d.get("mean_area", 0.0))
+        max_dev_mm  = float(d.get("max_dev_mm", 1e9))
+        n           = int(d.get("n", 0))
+        # lower reproj better, higher area better, lower jitter better, higher n better
+        return (mean_reproj, -mean_area, max_dev_mm, -n)
+
+    best_id = min(ids, key=score)
+    return best_id, "best-by-(reproj,area,jitter,n)"
 
 # Step 8: motion
 def move_to_joints(robot, q):
@@ -660,19 +729,40 @@ def live_marker_detection(cap, detector_tuple, K, dist, marker_len_m,
                 snap_active = False
                 print("[SNAPSHOT] Canceled.")
 
-        if key == ord("p"):
+        # quick manual selection: press '0' or '1'
+        if key in (ord("0"), ord("1")):
+            MANUAL_ID_FOR_MOTION = int(chr(key))
+            MOTION_SELECT_MODE = "manual"
+            print(f"[MOTION] Manual selection: MANUAL_ID_FOR_MOTION={MANUAL_ID_FOR_MOTION} (mode=manual)")
+
+        if key == ord(MOTION_KEY):
             preferred_id = int(ACTIVE_ID_FOR_MOTION)
 
-            if preferred_id in last_snapshot_result:
-                pick_id = preferred_id
-            else:
-                # If exactly one snapshot exists (e.g. only id=1 in frame), use it
+            pick_id, reason = choose_pick_id_for_motion(
+                last_snapshot_result,
+                mode=MOTION_SELECT_MODE,
+                active_id=preferred_id,
+                manual_id=MANUAL_ID_FOR_MOTION
+            )
+
+            if pick_id is None:
+                # fallback: if exactly one snapshot exists, use it
                 if len(last_snapshot_result) == 1:
                     pick_id = next(iter(last_snapshot_result.keys()))
-                    print(f"[MOTION] Active id={preferred_id} not available; using only stored id={pick_id}.")
+                    print(f"[MOTION] {reason}; fallback to only stored id={pick_id}.")
                 else:
-                    print(f"[MOTION] No snapshot stored for id={preferred_id}. Press 's' first.")
+                    print(f"[MOTION] {reason}. Press 's' first (and ensure IDs are stored).")
                     continue
+
+            # Optional: print why we picked it + its metrics
+            md = last_snapshot_result[pick_id]
+            print(
+                f"[MOTION] Pick selection: mode={MOTION_SELECT_MODE} -> id={pick_id} ({reason}) | "
+                f"mean_reproj={md.get('mean_reproj', float('nan')):.3f}px "
+                f"mean_area={md.get('mean_area', float('nan')):.0f} "
+                f"max_dev_mm={md.get('max_dev_mm', float('nan')):.2f} "
+                f"n={md.get('n', -1)}"
+            )
 
             xyz = last_snapshot_result[pick_id]["median_xyz"]
             x_m, y_m, z_m = [float(v) for v in xyz]
