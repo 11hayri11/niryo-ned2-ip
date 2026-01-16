@@ -22,3 +22,5 @@ ChArUco_Marker.png
 calibration_data/
 calibration_data_charuco/
 debug_snaps/
+
+ArUco_NotAccurateEnough/
