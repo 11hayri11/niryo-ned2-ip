@@ -324,7 +324,7 @@ def choose_multiview_candidate(cands):
 
         keys.append(key)
 
-    best_idx = int(np.argmin(np.array(keys, dtype=object)))  # works with tuples
+    best_idx = min(range(len(cands)), key=lambda i: keys[i])
 
     if MV_DEBUG_CHOICE:
         mode = "QUALITY_FIRST" if quality_first else "CONSENSUS_FIRST"
