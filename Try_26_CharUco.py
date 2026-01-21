@@ -48,13 +48,14 @@ USE_MULTIVIEW_ON_SNAPSHOT = True
 # Observation Views
 # Convention: view0 = PRIMARY view. The rest are optional coverage views.
 OBS_VIEWS = [
-    [0.0692,0.4766,-0.8567,0.0108,-1.2426,-0.0581],    # view0 primary
-    [-0.8453,-0.1323,-0.5704,0.4572,-1.5448,-0.1655],  # view1 from right
-    [0.7237,-0.3019,-0.1719,-0.2836,-1.7657,0.2087],   # view2 from left
-    [0.2762,-0.1156,-0.5825,-0.2806,-1.3499,0.155],    # view3 right coverage
-    [-0.2153,-0.0671,-0.5719,0.7026,-1.4405,-0.1164],  # view4 left coverage
+    [0.0997,0.3873,-0.8127,0.0108,-1.195,0.0154],     # view0 primary
+    [-0.7616,0.3388,-0.8158,-0.0489,-1.2165,-0.7991],  # view1 from right
+    [0.9413,0.2282,-0.7097,0.0905,-1.1904,0.7732],     # view2 from left
+    [0.1879,0.0994,-0.893,-0.5321,-1.1597,-0.0014],    # view3 right coverage
+    [-0.159,0.2797,-0.987,0.6673,-1.2456,-0.1793],     # view4 left coverage
     [0.6339,0.163,-0.7112,0.0323,-1.0447,0.5569],      # view5 bad zone coverage
-    [0.0692,-0.4156,-0.1386,-0.1379,-1.7196,0.2347],   # view6 right side edge zone
+    [-0.2427,-0.1762,-0.5567,-0.2852,-1.5218,-0.0842], # view6 right side edge zone
+    [0.3508,-0.3126,-0.0492,0.0645,-1.8101,0.0185],    # above - all
 ]
 
 PRIMARY_OBS = OBS_VIEWS[0]
@@ -66,7 +67,7 @@ AREA_MIN_PX2 = 3500           # gate for “too small / too blurry”
 # -----------------------------------------------------------------
 
 # Step 6: Snapshot settings -------------------
-SNAP_N                 = 12      # how many good samples to collect
+SNAP_N                 = 13      # how many good samples to collect
 SNAP_REPROJ_MAX_PX     = 0.40    # quality gate
 SNAP_AREA_MIN_PX2      = 3500    # can be >= AREA_MIN_PX2 (often same is fine)
 SNAP_TIMEOUT_S         = 6.0     # stop if we can't get enough good frames
@@ -101,7 +102,7 @@ MV_MEAN_AREA_MIN = 4500          # candidate gate across views
 MV_MAXDEV_MAX_MM = 2.5           # optional: reject “jittery” views
 MV_SPREAD_MAX_MM = 15.0          # optional: if views disagree too much -> warn/abort for motion
 MV_SPREAD_PRIORITIZE_REPROJ_MM = 6.0   # if cross-view disagreement > this, prefer reproj/area over consensus
-MV_DEBUG_CHOICE = False               # set True to print ranking diagnostics
+MV_DEBUG_CHOICE = True           # set True to print ranking diagnostics
 
 # helper ---------
 def load_intrinsics(run_dir: Path):
@@ -305,7 +306,7 @@ def choose_multiview_candidate(cands):
     spread_mm = float(np.max(dists_mm)) if len(dists_mm) else float("inf")
 
     # Build a sortable key per candidate (smaller is better).
-    # Switch strategy depending on how much the views disagree.
+    # Switch strategy depending on how much the views disagree.  
     quality_first = (spread_mm > MV_SPREAD_PRIORITIZE_REPROJ_MM)
 
     keys = []
