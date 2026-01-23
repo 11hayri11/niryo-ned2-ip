@@ -104,6 +104,14 @@ MV_SPREAD_MAX_MM = 15.0          # optional: if views disagree too much -> warn/
 MV_SPREAD_PRIORITIZE_REPROJ_MM = 6.0   # if cross-view disagreement > this, prefer reproj/area over consensus
 MV_DEBUG_CHOICE = True           # set True to print ranking diagnostics
 MV_QUALITY_REPROJ_EPS_PX = 0.02  # px; reproj within best+eps considered "tied"
+MV_QUALITY_REPROJ_EPS_STEP_PX = 0.01
+MV_QUALITY_REPROJ_EPS_MAX_PX  = 0.10   # cap so we don't accept garbage
+MV_QUALITY_DIST_MAX_MM = 9.0
+MV_QUALITY_REPROJ_EPS_STEP_PX = 0.01
+MV_QUALITY_REPROJ_EPS_MAX_PX  = 0.10
+MV_DIST_DEADZONE_MM = 3.0   # <= 3mm: treat as "same consensus"
+MV_DIST_Q_STEP_MM   = 1.0   # quantize distances outside deadzone
+MV_MIN_SAMPLES_PER_VIEW = 8   # try 8 (since you aim for 13)
 
 # helper ---------
 def load_intrinsics(run_dir: Path):
@@ -156,6 +164,12 @@ def rotmat_to_rpy_zyx(R: np.ndarray) -> np.ndarray:
 
     return np.array([roll, pitch, yaw], dtype=float)
 
+def dist_bucket_mm(dist_mm: float) -> float:
+    # deadzone: everything within MV_DIST_DEADZONE_MM becomes 0
+    if dist_mm <= MV_DIST_DEADZONE_MM:
+        return 0.0
+    # outside: quantize to reduce noise
+    return round(dist_mm / MV_DIST_Q_STEP_MM) * MV_DIST_Q_STEP_MM
 
 def closest_to_median_index(xyz: np.ndarray) -> int:
     med = np.median(xyz, axis=0)
@@ -293,74 +307,126 @@ def snapshot_one_view(cap, detector, K, dist, marker_len_m,
         }
     return results
 
-
 def choose_multiview_candidate(cands):
-    """
-    cands: list of result dicts (each already has median_xyz, mean_reproj, mean_area, max_dev_mm, etc.)
-    Returns: chosen dict, spread_mm
-    """
+    # --- basic guards ---
+    if not cands:
+        return None, float("inf")
+    if len(cands) == 1:
+        return cands[0], 0.0
+
     meds = np.array([c["median_xyz"] for c in cands], dtype=float)
     med_of_meds = np.median(meds, axis=0)
 
-    dists_m = np.linalg.norm(meds - med_of_meds[None, :], axis=1)
+    dists_m  = np.linalg.norm(meds - med_of_meds[None, :], axis=1)
     dists_mm = dists_m * 1000.0
     spread_mm = float(np.max(dists_mm)) if len(dists_mm) else float("inf")
 
-    # Switch strategy depending on how much the views disagree.
     quality_first = (spread_mm > MV_SPREAD_PRIORITIZE_REPROJ_MM)
 
-    # Pre-extract metrics (so we can reuse them cleanly)
-    reprojs = np.array([float(c.get("mean_reproj", 1e9)) for c in cands], dtype=float)
-    areas   = np.array([float(c.get("mean_area", 0.0)) for c in cands], dtype=float)
-    maxdevs = np.array([float(c.get("max_dev_mm", 1e9)) for c in cands], dtype=float)
+    # Dist gating config (soft/hard via flags)
+    dist_max = None if (MV_QUALITY_DIST_MAX_MM is None) else float(MV_QUALITY_DIST_MAX_MM)
+    if dist_max is not None:
+        good_dist_mask = (dists_mm <= dist_max)
+        any_good_dist = bool(np.any(good_dist_mask))
+    else:
+        good_dist_mask = np.ones(len(cands), dtype=bool)
+        any_good_dist = False  # irrelevant if dist_max is None
+
+    # Quantize dist to avoid float-noise tie-breaking
+    def quantize_mm(x, step=0.1):
+        return round(float(x) / step) * step
 
     keys = []
 
     if quality_first:
-        # QUALITY_FIRST (improved):
-        # 1) Find best reproj
-        # 2) Treat candidates within best+eps as "tied"
-        # 3) Within that shortlist prefer cluster closeness (dist), then stability (maxdev), then area
-        best_reproj = float(np.min(reprojs)) if len(reprojs) else 1e9
+        reproj_arr = np.array([float(c.get("mean_reproj", 1e9)) for c in cands], dtype=float)
+        best_reproj = float(np.min(reproj_arr))
+
         eps = float(MV_QUALITY_REPROJ_EPS_PX)
+        expanded = False
 
-        def key_quality(i):
-            in_short = (reprojs[i] <= best_reproj + eps)
-            # (shortlist_flag, dist, maxdev, -area, reproj)
-            return (0 if in_short else 1, float(dists_mm[i]), float(maxdevs[i]), -float(areas[i]), float(reprojs[i]))
+        def shortlist_indices(eps_val):
+            return [i for i, r in enumerate(reproj_arr) if r <= best_reproj + eps_val]
 
-        keys = [key_quality(i) for i in range(len(cands))]
+        # 1) Build shortlist FIRST (prevents UnboundLocalError)
+        shortlist = shortlist_indices(eps)
+
+        # 2) Expand eps until we have at least 2 candidates (your logic)
+        while len(shortlist) < 2 and eps < MV_QUALITY_REPROJ_EPS_MAX_PX:
+            eps = min(eps + MV_QUALITY_REPROJ_EPS_STEP_PX, MV_QUALITY_REPROJ_EPS_MAX_PX)
+            shortlist = shortlist_indices(eps)
+            expanded = True
+
+        # 3) OPTIONAL: try to keep shortlist within dist if possible (nice-to-have)
+        # (But even if shortlist stays "bad", hard gating below prevents choosing bad-dist.)
+        if dist_max is not None and any_good_dist:
+            shortlist2 = [i for i in shortlist if good_dist_mask[i]]
+            if len(shortlist2) >= 1:
+                shortlist = shortlist2
+
+        # 4) Build keys with HARD dist eligibility (minimal change to your structure)
+        for i, c in enumerate(cands):
+            area   = float(c.get("mean_area", 0.0))
+            maxdev = float(c.get("max_dev_mm", 1e9))
+            reproj = float(reproj_arr[i])
+
+            dist   = float(dists_mm[i])
+            dist_q = dist_bucket_mm(dist)   # <<<<<< REPLACE quantize_mm(., 0.1)
+
+            in_short = (i in shortlist)
+            flag = 0 if in_short else 1
+
+            bad_dist_flag = 0
+            if dist_max is not None and any_good_dist and (not good_dist_mask[i]):
+                bad_dist_flag = 1
+
+            # Key change: put reproj BEFORE maxdev, but only matters when dist_q ties (e.g., deadzone=0)
+            key = (bad_dist_flag, flag, dist_q, reproj, maxdev, -area)
+            keys.append(key)
+
         best_idx = min(range(len(cands)), key=lambda i: keys[i])
 
-    else:
-        # CONSENSUS_FIRST (unchanged idea):
-        # Prefer consensus; still use quality as tie-break.
-        def key_consensus(i):
-            return (float(dists_mm[i]), float(reprojs[i]), -float(areas[i]), float(maxdevs[i]))
 
-        keys = [key_consensus(i) for i in range(len(cands))]
-        best_idx = min(range(len(cands)), key=lambda i: keys[i])
+        if MV_DEBUG_CHOICE:
+            if dist_max is not None:
+                print(f"... good_dist={int(np.sum(good_dist_mask))}/{len(cands)} (<= {dist_max:.1f}mm), any_good={any_good_dist}")
+            print(f"[CHOOSE] mode=QUALITY_FIRST spread_mm={spread_mm:.1f} best_reproj={best_reproj:.3f}px "
+                  f"eps={eps:.3f}px{' (expanded)' if expanded else ''}")
+
+            order = sorted(range(len(cands)), key=lambda i: keys[i])
+            for rank, i in enumerate(order[:min(5, len(order))]):
+                c = cands[i]
+                tag = "S" if i in shortlist else " "
+                dist = float(dists_mm[i])
+                dist_q = quantize_mm(dist, step=0.1)
+                bd = 1 if (dist_max is not None and any_good_dist and not good_dist_mask[i]) else 0
+                print(f"  rank={rank} view={c.get('view_index')} key={keys[i]} {tag} "
+                      f"bad_dist={bd} reproj={float(reproj_arr[i]):.3f}px area={c.get('mean_area'):.0f} "
+                      f"maxdev={c.get('max_dev_mm'):.2f}mm dist={dist:.1f}mm dist_q={dist_q:.1f}mm")
+
+        return cands[best_idx], spread_mm
+
+    # -------- CONSENSUS_FIRST unchanged (optional dist quantization if you want) --------
+    for i, c in enumerate(cands):
+        reproj = float(c.get("mean_reproj", 1e9))
+        area   = float(c.get("mean_area", 0.0))
+        maxdev = float(c.get("max_dev_mm", 1e9))
+        dist   = float(dists_mm[i])
+        key = (dist, reproj, -area, maxdev)
+        keys.append(key)
+
+    best_idx = min(range(len(cands)), key=lambda i: keys[i])
 
     if MV_DEBUG_CHOICE:
-        mode = "QUALITY_FIRST" if quality_first else "CONSENSUS_FIRST"
-        if quality_first:
-            print(f"[CHOOSE] mode={mode} spread_mm={spread_mm:.1f} best_reproj={np.min(reprojs):.3f}px eps={MV_QUALITY_REPROJ_EPS_PX:.3f}px")
-        else:
-            print(f"[CHOOSE] mode={mode} spread_mm={spread_mm:.1f}")
-
+        print(f"[CHOOSE] mode=CONSENSUS_FIRST spread_mm={spread_mm:.1f}")
         order = sorted(range(len(cands)), key=lambda i: keys[i])
         for rank, i in enumerate(order[:min(5, len(order))]):
             c = cands[i]
-            # In QUALITY_FIRST, keys[i][0]==0 means candidate is in shortlist
-            shortlist_tag = ""
-            if quality_first:
-                shortlist_tag = " S" if keys[i][0] == 0 else "  "
-            print(f"  rank={rank} view={c.get('view_index')} key={keys[i]}{shortlist_tag}"
-                  f" reproj={c.get('mean_reproj'):.3f}px area={c.get('mean_area'):.0f}"
-                  f" maxdev={c.get('max_dev_mm'):.2f}mm dist={dists_mm[i]:.1f}mm")
+            print(f"  rank={rank} view={c.get('view_index')} key={keys[i]} "
+                  f"reproj={c.get('mean_reproj'):.3f}px area={c.get('mean_area'):.0f} "
+                  f"maxdev={c.get('max_dev_mm'):.2f}mm dist={dists_mm[i]:.1f}mm")
 
     return cands[best_idx], spread_mm
-
 
 def multiview_snapshot(robot, cap, detector, K, dist, marker_len_m,
                       T_hand_camera, q6_ref,
@@ -417,7 +483,7 @@ def multiview_snapshot(robot, cap, detector, K, dist, marker_len_m,
                 continue
             r = view_res[mid]
             # candidate gates
-            if r["n"] < snap_n:
+            if r["n"] < MV_MIN_SAMPLES_PER_VIEW:
                 continue
             if r["mean_reproj"] > MV_REPROJ_MAX_PX:
                 continue
