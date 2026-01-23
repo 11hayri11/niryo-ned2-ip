@@ -103,6 +103,7 @@ MV_MAXDEV_MAX_MM = 2.5           # optional: reject “jittery” views
 MV_SPREAD_MAX_MM = 15.0          # optional: if views disagree too much -> warn/abort for motion
 MV_SPREAD_PRIORITIZE_REPROJ_MM = 6.0   # if cross-view disagreement > this, prefer reproj/area over consensus
 MV_DEBUG_CHOICE = True           # set True to print ranking diagnostics
+MV_QUALITY_REPROJ_EPS_PX = 0.02  # px; reproj within best+eps considered "tied"
 
 # helper ---------
 def load_intrinsics(run_dir: Path):
@@ -305,39 +306,61 @@ def choose_multiview_candidate(cands):
     dists_mm = dists_m * 1000.0
     spread_mm = float(np.max(dists_mm)) if len(dists_mm) else float("inf")
 
-    # Build a sortable key per candidate (smaller is better).
-    # Switch strategy depending on how much the views disagree.  
+    # Switch strategy depending on how much the views disagree.
     quality_first = (spread_mm > MV_SPREAD_PRIORITIZE_REPROJ_MM)
 
+    # Pre-extract metrics (so we can reuse them cleanly)
+    reprojs = np.array([float(c.get("mean_reproj", 1e9)) for c in cands], dtype=float)
+    areas   = np.array([float(c.get("mean_area", 0.0)) for c in cands], dtype=float)
+    maxdevs = np.array([float(c.get("max_dev_mm", 1e9)) for c in cands], dtype=float)
+
     keys = []
-    for i, c in enumerate(cands):
-        reproj = float(c.get("mean_reproj", 1e9))
-        area   = float(c.get("mean_area", 0.0))
-        maxdev = float(c.get("max_dev_mm", 1e9))
-        dist   = float(dists_mm[i])
 
-        if quality_first:
-            # Prefer best pose quality; consensus only as late tie-break.
-            key = (reproj, -area, maxdev, dist)
-        else:
-            # Prefer consensus; still use quality as tie-break.
-            key = (dist, reproj, -area, maxdev)
+    if quality_first:
+        # QUALITY_FIRST (improved):
+        # 1) Find best reproj
+        # 2) Treat candidates within best+eps as "tied"
+        # 3) Within that shortlist prefer cluster closeness (dist), then stability (maxdev), then area
+        best_reproj = float(np.min(reprojs)) if len(reprojs) else 1e9
+        eps = float(MV_QUALITY_REPROJ_EPS_PX)
 
-        keys.append(key)
+        def key_quality(i):
+            in_short = (reprojs[i] <= best_reproj + eps)
+            # (shortlist_flag, dist, maxdev, -area, reproj)
+            return (0 if in_short else 1, float(dists_mm[i]), float(maxdevs[i]), -float(areas[i]), float(reprojs[i]))
 
-    best_idx = min(range(len(cands)), key=lambda i: keys[i])
+        keys = [key_quality(i) for i in range(len(cands))]
+        best_idx = min(range(len(cands)), key=lambda i: keys[i])
+
+    else:
+        # CONSENSUS_FIRST (unchanged idea):
+        # Prefer consensus; still use quality as tie-break.
+        def key_consensus(i):
+            return (float(dists_mm[i]), float(reprojs[i]), -float(areas[i]), float(maxdevs[i]))
+
+        keys = [key_consensus(i) for i in range(len(cands))]
+        best_idx = min(range(len(cands)), key=lambda i: keys[i])
 
     if MV_DEBUG_CHOICE:
         mode = "QUALITY_FIRST" if quality_first else "CONSENSUS_FIRST"
-        print(f"[CHOOSE] mode={mode} spread_mm={spread_mm:.1f}")
+        if quality_first:
+            print(f"[CHOOSE] mode={mode} spread_mm={spread_mm:.1f} best_reproj={np.min(reprojs):.3f}px eps={MV_QUALITY_REPROJ_EPS_PX:.3f}px")
+        else:
+            print(f"[CHOOSE] mode={mode} spread_mm={spread_mm:.1f}")
+
         order = sorted(range(len(cands)), key=lambda i: keys[i])
         for rank, i in enumerate(order[:min(5, len(order))]):
             c = cands[i]
-            print(f"  rank={rank} view={c.get('view_index')} key={keys[i]} "
-                  f"reproj={c.get('mean_reproj'):.3f}px area={c.get('mean_area'):.0f} "
-                  f"maxdev={c.get('max_dev_mm'):.2f}mm dist={dists_mm[i]:.1f}mm")
+            # In QUALITY_FIRST, keys[i][0]==0 means candidate is in shortlist
+            shortlist_tag = ""
+            if quality_first:
+                shortlist_tag = " S" if keys[i][0] == 0 else "  "
+            print(f"  rank={rank} view={c.get('view_index')} key={keys[i]}{shortlist_tag}"
+                  f" reproj={c.get('mean_reproj'):.3f}px area={c.get('mean_area'):.0f}"
+                  f" maxdev={c.get('max_dev_mm'):.2f}mm dist={dists_mm[i]:.1f}mm")
 
     return cands[best_idx], spread_mm
+
 
 def multiview_snapshot(robot, cap, detector, K, dist, marker_len_m,
                       T_hand_camera, q6_ref,
